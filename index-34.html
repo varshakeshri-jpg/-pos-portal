@@ -969,9 +969,12 @@ function sbSaveLead(lead){
   };
   return fetch(SB_URL + "/rest/v1/leads", {
     method: "POST",
-    headers: Object.assign({}, sbHeaders(), {"Prefer": "resolution=merge-duplicates,return=representation"}),
+    headers: Object.assign({}, sbHeaders(), {"Prefer": "resolution=merge-duplicates,return=representation","Content-Type":"application/json"}),
     body: JSON.stringify(row)
-  }).then(function(r){ return r.json(); }).catch(function(e){ console.error("sbSaveLead",e); });
+  }).then(function(r){
+    if(!r.ok) return r.text().then(function(t){console.error("sbSaveLead error:",t);});
+    return r.json();
+  }).catch(function(e){ console.error("sbSaveLead",e); });
 }
 
 // ── UPDATE lead in Supabase ──
@@ -1019,41 +1022,62 @@ function sbSaveCred(cred){
 var SB_SYNC_INTERVAL = null;
 function startSBSync(){
   if(SB_SYNC_INTERVAL) clearInterval(SB_SYNC_INTERVAL);
-  SB_SYNC_INTERVAL = setInterval(function(){
-    sbGetLeads().then(function(sbLeads){
-      if(!sbLeads.length) return;
-      // Merge SB leads with local leads
-      var local = getLeads();
-      var localIds = {};
-      local.forEach(function(l){ localIds[l.id] = true; });
-      var newFromSB = sbLeads.filter(function(l){ return !localIds[l.id]; });
-      if(newFromSB.length){
-        // Add new leads from Supabase to local storage
-        var newLeads = JSON.parse(localStorage.getItem("rz_new_leads")||"[]");
-        newFromSB.forEach(function(l){ newLeads.push(l); });
-        localStorage.setItem("rz_new_leads", JSON.stringify(newLeads));
-        updBadge();
-        // Refresh current page if on leads
-        if(document.getElementById("pg-aov") && document.getElementById("pg-aov").classList.contains("active")){
-          renderAdminOverview();
+  // Run immediately on login, then every 10 seconds
+  doSBSync();
+  SB_SYNC_INTERVAL = setInterval(doSBSync, 10000);
+}
+
+function doSBSync(){
+  sbGetLeads().then(function(sbLeads){
+    if(!Array.isArray(sbLeads)||!sbLeads.length) return;
+
+    // Save ALL Supabase leads into rz_new_leads so getLeads() picks them up
+    var existing = JSON.parse(localStorage.getItem("rz_new_leads")||"[]");
+    var existingIds = {};
+    existing.forEach(function(l){ existingIds[l.id]=true; });
+
+    var changed = false;
+    sbLeads.forEach(function(sbL){
+      if(!existingIds[sbL.id]){
+        // New lead from another user — add it
+        existing.push(sbL);
+        changed = true;
+      } else {
+        // Update status if changed
+        var idx2 = existing.findIndex(function(l){return l.id===sbL.id;});
+        if(idx2>-1){
+          var loc = existing[idx2];
+          if(loc.status!==sbL.status||loc.currentStage!==sbL.currentStage||loc.tids!==sbL.tids){
+            existing[idx2] = Object.assign({},loc,{
+              status:sbL.status,
+              currentStage:sbL.currentStage,
+              tids:sbL.tids,
+              orgcode:sbL.orgcode,
+              adminNote:sbL.adminNote,
+              assignedPOC:sbL.assignedPOC,
+              assignedVH:sbL.assignedVH
+            });
+            changed = true;
+          }
         }
       }
-      // Update existing lead statuses from SB
-      sbLeads.forEach(function(sbL){
-        var existing = local.find(function(l){ return l.id === sbL.id; });
-        if(existing && existing.status !== sbL.status){
-          var upd = JSON.parse(localStorage.getItem("rz_lead_upd")||"{}");
-          if(!upd[sbL.id]) upd[sbL.id] = {};
-          upd[sbL.id].status = sbL.status;
-          upd[sbL.id].currentStage = sbL.currentStage;
-          upd[sbL.id].tids = sbL.tids;
-          upd[sbL.id].orgcode = sbL.orgcode;
-          upd[sbL.id].adminNote = sbL.adminNote;
-          localStorage.setItem("rz_lead_upd", JSON.stringify(upd));
-        }
-      });
     });
-  }, 10000);
+
+    if(changed){
+      localStorage.setItem("rz_new_leads", JSON.stringify(existing));
+      updBadge();
+      // Refresh whichever page is currently visible
+      var activePage = document.querySelector(".page.active")||document.querySelector(".page[style*='block']");
+      if(activePage){
+        var pid = activePage.id;
+        if(pid==="pg-aov")      renderAdminOverview();
+        else if(pid==="pg-pov") renderPartnerOverview();
+        else if(pid==="pg-master-ov") renderMasterDashboard();
+        else if(pid==="pg-leads") renderAdminLeads(LEAD_FILTER);
+      }
+      showT("\u2705 "+sbLeads.length+" leads synced from database.");
+    }
+  }).catch(function(e){ console.error("SB sync error:", e); });
 }
 
 var USERS = {
@@ -1923,34 +1947,10 @@ function submitLead(){
   sbSaveLead(lead);
   var newId = lead.id;
 
-  // ── AUTO EMAIL TO VARSHA ──
-  var ld2 = lead.data||{};
-  var emailSubject = encodeURIComponent("[POS Portal] New lead: "+(ld2.l_merch_name||"Unknown")+" from "+(lead.partner||"Partner"));
-  var emailBody = encodeURIComponent(
-    "New lead submitted via POS Partner Portal\n"
-    +"========================================\n\n"
-    +"Lead ID      : "+newId+"\n"
-    +"Partner      : "+(lead.partner||"")+"\n"
-    +"Merchant     : "+(ld2.l_merch_name||"")+"\n"
-    +"City         : "+(ld2.l_city||"")+"\n"
-    +"POS Required : "+(ld2.l_pos_count||"")+"\n"
-    +"MCC Category : "+(ld2.l_mcc||"")+"\n"
-    +"Contact      : "+(ld2.l_contact_nm||"")+" | "+(ld2.l_contact_ph||"")+"\n"
-    +"Est. Volume  : "+(ld2.l_vol||"")+"\n"
-    +"Notes        : "+(ld2.l_notes||"")+"\n"
-    +"Submitted at : "+(lead.submittedAt||"")+"\n\n"
-    +"Action needed: Login to the portal and assign a Sales POC."
-  );
-  var gmailURL = "https://mail.google.com/mail/?view=cm&fs=1"
-    +"&to="+encodeURIComponent("varsha.keshri@razorpay.com")
-    +"&su="+emailSubject
-    +"&body="+emailBody;
-  window.open(gmailURL, "_blank");
-
   LEAD_FD={};
   switchLeadTab("track");
   renderMyLeads();
-  showT("\u2705 Lead submitted! ID: "+newId+" \u2014 Gmail opened to notify Varsha. Please click Send.");
+  showT("\u2705 Lead submitted! ID: "+newId+" -- Varsha will see it shortly.");
 }
 
 function switchLeadTab(tab){
